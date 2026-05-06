@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf '%s\n' \
+        "Usage: waydroid-storage [command] [args]" \
+        "" \
+        "Commands:" \
+        "  repair [host-dir]  Mount Android storage, then bind host-dir to Download." \
+        "                     host-dir defaults to ~/Downloads. This is the default." \
+        "  mount              Mount Android /sdcard inside Waydroid." \
+        "  bind [host-dir]    Bind host-dir to Android's Download folder." \
+        "  unbind             Unmount the Download bind mount." \
+        "  status             Show Waydroid storage and bind-mount status." \
+        "" \
+        "Environment overrides:" \
+        "  WAYDROID_HOST_DATA_PATH      Waydroid data path on the host." \
+        "  WAYDROID_ANDROID_USER_ID     Android user id, defaults to 0." \
+        "  help               Show this help."
+}
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+as_root() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        die "This command needs root privileges, but sudo was not found."
+    fi
+}
+
+session_running() {
+    waydroid status 2>/dev/null | grep -q $'Session:\tRUNNING'
+}
+
+ensure_session() {
+    if ! session_running; then
+        die "Waydroid session is not running. Start Waydroid, then run this again."
+    fi
+}
+
+connect_adb() {
+    need_command adb
+    need_command waydroid
+
+    waydroid adb connect >/dev/null 2>&1 || true
+
+    for _ in {1..45}; do
+        if adb get-state >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    die "No Waydroid ADB device appeared within 45 seconds. Start Waydroid, then run this again."
+}
+
+android_volume_id() {
+    local volume
+
+    volume="$(adb shell sm list-volumes all 2>/dev/null | awk '/^emulated;[0-9]+/ { print $1; exit }' | tr -d '\r')"
+    if [[ -z "$volume" ]]; then
+        volume="emulated;$(android_user_id)"
+    fi
+
+    printf '%s\n' "$volume"
+}
+
+android_user_id() {
+    if [[ -n "${WAYDROID_ANDROID_USER_ID:-}" ]]; then
+        printf '%s\n' "$WAYDROID_ANDROID_USER_ID"
+        return 0
+    fi
+
+    if adb get-state >/dev/null 2>&1; then
+        adb shell am get-current-user 2>/dev/null | awk '/^[0-9]+$/ { print; found = 1; exit } END { if (!found) print "0" }'
+        return 0
+    fi
+
+    printf '0\n'
+}
+
+host_data_path() {
+    local path
+
+    if [[ -n "${WAYDROID_HOST_DATA_PATH:-}" ]]; then
+        printf '%s\n' "${WAYDROID_HOST_DATA_PATH%/}"
+        return 0
+    fi
+
+    if [[ -r /var/lib/waydroid/waydroid.prop ]]; then
+        path="$(awk -F= '$1 == "waydroid.host_data_path" { print $2; exit }' /var/lib/waydroid/waydroid.prop)"
+        if [[ -n "$path" ]]; then
+            printf '%s\n' "${path%/}"
+            return 0
+        fi
+    fi
+
+    if session_running; then
+        path="$(waydroid prop get waydroid.host_data_path 2>/dev/null | awk '/^\// { print; exit }' || true)"
+        if [[ -n "$path" ]]; then
+            printf '%s\n' "${path%/}"
+            return 0
+        fi
+    fi
+
+    for path in "$HOME/.local/share/waydroid/data" /var/lib/waydroid/data; do
+        if [[ -d "$path" ]]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+
+    die "Could not detect Waydroid host data path. Set WAYDROID_HOST_DATA_PATH and retry."
+}
+
+target_download_dir() {
+    printf '%s/media/%s/Download\n' "$(host_data_path)" "$(android_user_id)"
+}
+
+mount_android_storage() {
+    local escaped_volume storage_path user_id volume
+
+    ensure_session
+    connect_adb
+
+    volume="$(android_volume_id)"
+    user_id="${volume#emulated;}"
+    storage_path="/storage/emulated/$user_id"
+    escaped_volume="${volume//;/\\;}"
+
+    for _ in {1..30}; do
+        if adb shell sm list-volumes all | grep -q "^$volume mounted"; then
+            echo "Waydroid emulated storage is mounted."
+            adb shell df -h "$storage_path"
+            return 0
+        fi
+
+        adb shell "sm mount $escaped_volume" >/dev/null 2>&1 || true
+        sleep 1
+    done
+
+    echo "Waydroid emulated storage did not mount. Current volumes:" >&2
+    adb shell sm list-volumes all >&2
+    exit 1
+}
+
+bind_downloads() {
+    local source_dir="${1:-$HOME/Downloads}"
+    local target_dir
+
+    [[ -d "$source_dir" ]] || die "Source directory does not exist: $source_dir"
+
+    target_dir="$(target_download_dir)"
+
+    as_root mkdir -p "$target_dir"
+
+    if as_root mountpoint -q "$target_dir"; then
+        echo "Waydroid Download is already a mount point: $target_dir"
+        return 0
+    fi
+
+    as_root mount --bind "$source_dir" "$target_dir"
+    echo "Bound $source_dir to Waydroid's Download folder."
+}
+
+unbind_downloads() {
+    local target_dir
+
+    target_dir="$(target_download_dir)"
+
+    if as_root mountpoint -q "$target_dir"; then
+        as_root umount "$target_dir"
+        echo "Unmounted Waydroid Download bind mount."
+    else
+        echo "Waydroid Download is not a bind mount."
+    fi
+}
+
+download_is_bound() {
+    local target_dir
+
+    target_dir="$(target_download_dir)"
+    awk -v target="$target_dir" '$5 == target { found = 1 } END { exit !found }' /proc/self/mountinfo
+}
+
+show_status() {
+    local target_dir volumes
+
+    waydroid status || true
+
+    if adb get-state >/dev/null 2>&1; then
+        echo
+        volumes="$(adb shell sm list-volumes all || true)"
+        printf '%s\n' "$volumes"
+
+        if printf '%s\n' "$volumes" | grep -q '^emulated;[0-9]\+ mounted'; then
+            adb shell df -h "/storage/emulated/$(android_user_id)" || true
+        elif ! printf '%s\n' "$volumes" | grep -q '^emulated;[0-9]\+'; then
+            echo "emulated storage: not registered by Android storage manager"
+        fi
+    else
+        echo
+        echo "ADB device: not connected"
+    fi
+
+    echo
+    if target_dir="$(target_download_dir 2>/dev/null)"; then
+        if download_is_bound; then
+            echo "Download bind mount: mounted at $target_dir"
+        else
+            echo "Download bind mount: not mounted at $target_dir"
+        fi
+    else
+        echo "Download bind mount: unknown; could not detect Waydroid host data path"
+    fi
+}
+
+command="${1:-repair}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+case "$command" in
+    repair)
+        mount_android_storage
+        bind_downloads "$@"
+        ;;
+    mount)
+        mount_android_storage
+        ;;
+    bind)
+        bind_downloads "$@"
+        ;;
+    unbind | umount | unmount)
+        unbind_downloads
+        ;;
+    status)
+        show_status
+        ;;
+    help | -h | --help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
