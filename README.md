@@ -1,145 +1,198 @@
-# waydroid-on-asahi
+# Waydroid on Asahi
 
-Apple Silicon MacBooks are well suited to running Android natively: they are fast ARM64 machines with powerful GPUs. The main catch is that M-series chips use 16 KiB memory pages, while Android historically assumed 4 KiB pages. Android only gained support for 16 KiB page sizes recently,[^1] and the Asahi + Waydroid setup is still niche enough that ready-made images are not generally available.
+I compiled the images using GCE VM, c2d-highcpu-112. Took me an hour to compile  both images excluding setup time.
+Credits to [UtkarshVerma](https://github.com/UtkarshVerma) for the guide on building the images!
 
-This repository documents how I built a custom Android image for Waydroid on Asahi Linux. The process is based on [Waydroid's custom image guide](https://docs.waydro.id/faq/using-custom-waydroid-images), the [Waydroid-ATV build instructions](https://github.com/WayDroid-ATV/waydroid-builds/blob/main/BUILDING.md), and build notes shared by a very helpful contributor on the Asahi IRC.
+These images are built for:
+
+- Apple Silicon / Asahi Linux
+- ARM64-only Android userspace
+- 16 KiB page size
+- Mesa / Asahi graphics
 
 ## Known issues
 
-- Camera support does not work.
+- Camera support does not currently work.
+- Google Apps are not included.
+- This setup is experimental.
+- These images are intended for Apple Silicon Asahi systems.
+## Downloads
 
-## Building
+Download the latest files from the Releases page.
 
-Android is a large project. On a Google Cloud Platform VM with 32 vCPUs, 32 GiB of memory, and 400 GiB of attached storage, the build took roughly four hours, excluding setup time.
+The release should contain:
 
-### 1. Install Nix
+```text
+system.img
+vendor.img
+SHA256SUMS
+````
 
-Install the [Nix package manager](https://nixos.org/download/).
+## Install the images
 
-### 2. Clone this repository
+Create Waydroid’s custom image directory:
 
-```sh
-git clone https://github.com/UtkarshVerma/waydroid-on-asahi.git
-cd waydroid-on-asahi
+```bash
+sudo mkdir -p /etc/waydroid-extra/images
 ```
 
-Optionally configure Git if this is a fresh build machine:
+Copy the images:
 
-```sh
-git config --global user.name "Placebo"
-git config --global user.email "placebo@mail.com"
+```bash
+sudo cp system.img vendor.img /etc/waydroid-extra/images/
 ```
 
-### 3. Enter the development shell
+Then re-initialize Waydroid:
 
-The repository provides a `shell.nix` with the required build tools.
-
-```sh
-nix-shell
+```bash
+sudo waydroid init -f
 ```
 
-### 4. Fetch the Android sources
+Restart the container:
 
-```sh
-repo init -u https://github.com/LineageOS/android.git -b lineage-23.0 --git-lfs
-
-repo sync build/make
-
-wget -O - https://raw.githubusercontent.com/WayDroid-ATV/android_vendor_waydroid/lineage-23.0/manifest_scripts/generate-manifest.sh | bash
-
-repo sync -j"$(nproc --all)"
+```bash
+sudo systemctl restart waydroid-container
 ```
 
-`repo sync` may fail partway through, especially on large or unreliable connections. If it does, retry with lower parallelism:
+Start a session:
 
-```sh
-repo sync -j1 --fail-fast
+```bash
+waydroid session start
 ```
 
-### 5. Fetch Git LFS assets
+Launch the UI:
 
-Some prebuilts are stored through Git LFS and need to be pulled explicitly:
+```Run it using the waydroid app in launchpad.. Running using waydroid show-full-ui did not work for me```
 
-```sh
-git -C prebuilts/mesa-tools lfs pull
+## Fix storage and downloads
+Initially the storage mount will be broken and you'll be unable to download any 
+apps or use internal storage.. To fix this
 
-git -C external/chromium-webview/prebuilt/arm64 lfs install
-git -C external/chromium-webview/prebuilt/arm64 lfs pull
+
+Clone this repositry.
+
+Then run
+```bash
+./waydroid-storage
 ```
 
-If the build later fails because of missing prebuilt files, run `git lfs pull` in the relevant repository.
+That runs the default repair flow:
 
-### 6. Apply the Waydroid patches
+- remount Android's emulated storage
+- bind your host `~/Downloads` folder into Android's `Download` folder
 
-```sh
-. build/envsetup.sh
-apply-waydroid-patches
+Useful subcommands:
+
+```bash
+./waydroid-storage status
+./waydroid-storage mount
+./waydroid-storage bind
+./waydroid-storage unbind
 ```
 
-### 7. Configure the build for Asahi
+## Fix network
 
-Edit `device/waydroid/waydroid/waydroid_arm64_only/lineage_waydroid_arm64_only.mk`.
+If Waydroid has no internet access, run the network helper from the repository
+root:
 
-Optionally remove Google apps by commenting out this line:
-
-```makefile
-$(call inherit-product, vendor/gapps/arm64/arm64-vendor.mk)
+```bash
+sudo ./fix_waydroid_network.sh
 ```
 
-Then add the 16 KiB page-size configuration:
+It enables IPv4 forwarding and applies the Waydroid firewall rules for either
+`firewalld` or `iptables`, depending on what the host is using. You do not
+need to stop Waydroid first.
 
-```makefile
-PRODUCT_NO_BIONIC_PAGE_SIZE_MACRO := true
-PRODUCT_MAX_PAGE_SIZE_SUPPORTED := 16384
-PRODUCT_CHECK_PREBUILT_MAX_PAGE_SIZE := true
+This helper is intended for Fedora Asahi systems using Waydroid's default
+bridge-based networking and either `firewalld` or an `iptables`/
+`iptables-legacy` compatibility path. 
+## Verify that Android booted
+
+Check Waydroid status:
+
+```bash
+waydroid status
 ```
 
-Next, edit `device/waydroid/waydroid/waydroid_arm64_only/BoardConfig.mk`.
+Expected status should show both the session and container running:
 
-Enable the Asahi Mesa driver and disable `MALLOC_SVELTE`:
-
-```makefile
-BOARD_MESA3D_VULKAN_DRIVERS += asahi
-BOARD_MESA3D_GALLIUM_DRIVERS += asahi
-
-# MALLOC_SVELTE := true
+```text
+Session:   RUNNING
+Container: RUNNING
 ```
 
-Then edit `device/waydroid/waydroid/device.mk`.
+Then verify Android boot completion:
 
-Remove the external camera provider package:
-
-```makefile
-android.hardware.camera.provider@2.7-external-service
+```bash
+sudo waydroid shell getprop sys.boot_completed
 ```
 
-Also remove the unnecessary Vulkan drivers from the non-x86 branch:
+Expected output:
 
-```makefile
-ifneq ($(filter %_x86 %_x86_64,$(TARGET_PRODUCT)),)
-PRODUCT_PACKAGES += \
-    vulkan.intel \
-    vulkan.intel_hasvk \
-    vulkan.radeon \
-    vulkan.nouveau
-else
-    # Remove the unnecessary Vulkan drivers here.
-endif
+```text
+1
 ```
 
-Finally, edit `external/ffmpeg/libavcodec/mpegvideo.c` and add `&& ARCH_ARM` to the `ff_mpv_common_init_neon` condition.
+## Troubleshooting
 
-### 8. Build the images
 
-```sh
-lunch lineage_waydroid_arm64_only-bp2a-userdebug
+### `Polkit: Authentication failed`
 
-make systemimage -j"$(nproc --all)"
-make vendorimage -j"$(nproc --all)"
+Run initialization with `sudo`:
+
+```bash
+sudo waydroid init -f
 ```
 
-The system image builds cleanly. The vendor image was more troublesome: the Android build system accepted host tools from `/bin`, but not equivalent tools from `/nix/store`. I did not investigate this deeply and instead installed the offending tools directly on the host OS.
+### `Failed to get service waydroidplatform`
 
-If someone figures out how to fix this properly, contributions would be very welcome. It would make the build much more reproducible across distributions.
+If Android booted but the UI does not open, restart the session and container:
 
-[^1]: Android added support for 16 KiB page sizes starting with Android 15.
+```bash
+waydroid session stop
+sudo systemctl restart waydroid-container
+waydroid session start
+waydroid show-full-ui
+```
+
+Check whether Android actually booted:
+
+```bash
+sudo waydroid shell getprop sys.boot_completed
+```
+
+If it returns `1`, the container is running and the issue is likely with the UI
+or Waydroid platform service.
+
+A way I found to bypass this issue is to launch it directly from the shortcut waydroid created.
+
+Useful logs:
+
+```bash
+waydroid log
+sudo journalctl -u waydroid-container -b --no-pager | tail -100
+```
+
+### Confirm that custom images are being used
+
+Waydroid should mount the images from:
+
+```text
+/etc/waydroid-extra/images/system.img
+/etc/waydroid-extra/images/vendor.img
+```
+
+You can check the log:
+
+```bash
+waydroid log | grep /etc/waydroid-extra/images
+```
+
+## Notes
+
+These images were built from LineageOS / Waydroid sources with Asahi Mesa support
+enabled and 16 KiB page-size configuration applied.
+
+The build process is not documented here because prebuilt images are provided.
+
+For the build process, go [here](https://github.com/UtkarshVerma/waydroid-on-asahi).
