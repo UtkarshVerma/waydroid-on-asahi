@@ -2,7 +2,7 @@
 
 Apple Silicon MacBooks are well suited to running Android natively: they are fast ARM64 machines with powerful GPUs. The main catch is that M-series chips use 16 KiB memory pages, while Android historically assumed 4 KiB pages. Android only gained support for 16 KiB page sizes recently,[^1] and the Asahi + Waydroid setup is still niche enough that ready-made images are not generally available.
 
-This repository documents how I built a custom Android image for Waydroid on Asahi Linux. The process is based on [Waydroid's custom image guide](https://docs.waydro.id/faq/using-custom-waydroid-images), the [Waydroid-ATV build instructions](https://github.com/WayDroid-ATV/waydroid-builds/blob/main/BUILDING.md), and build notes shared by a very helpful contributor on the Asahi IRC.
+This repository documents how I built a custom Android image for Waydroid on Asahi Linux. The process is based on [Waydroid's custom image guide](https://docs.waydro.id/faq/using-custom-waydroid-images), the [Waydroid-ATV build instructions](https://github.com/WayDroid-ATV/waydroid-builds/blob/main/BUILDING.md), and [build notes shared by a very helpful contributor on the Asahi IRC](https://paste.sh/o5VtbQ3M#DWggLqDtBk6eomDsVemc-sV3).
 
 ## Known issues
 
